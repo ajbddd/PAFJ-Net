@@ -832,3 +832,251 @@ class SCDown(nn.Module):
         return self.cv2(self.cv1(x))
 
 
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8,
+                 attn_ratio=0.5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim ** -0.5
+        nh_kd = nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = Conv(dim, h, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, -1, N).split([self.key_dim, self.key_dim, self.head_dim], dim=2)
+
+        attn = (
+            (q.transpose(-2, -1) @ k) * self.scale
+        )
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W) + self.pe(v.reshape(B, -1, H, W))
+        x = self.proj(x)
+        return x
+
+class CWConcat(nn.Module):
+    def __init__(self, dimension=1, Channel1=1, Channel2=1):
+        super(CWConcat, self).__init__()
+        self.d = dimension
+        self.Channel1 = Channel1
+        self.Channel2 = Channel2
+        self.Channel_all = int(Channel1 + Channel2)
+        self.w = nn.Parameter(torch.ones(self.Channel_all, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+    
+
+    def forward(self, x):
+        N1, C1, H1, W1 = x[0].size()
+        N2, C2, H2, W2 = x[1].size()
+
+        w = self.w[:(C1 + C2)]  
+        weight = w / (torch.sum(w, dim=0) + self.epsilon) 
+        # Fast normalized fusion
+
+        x1 = (weight[:C1] * x[0].view(N1, H1, W1, C1)).view(N1, C1, H1, W1)
+        x2 = (weight[C1:] * x[1].view(N2, H2, W2, C2)).view(N2, C2, H2, W2)
+        x = [x1, x2]
+        return torch.cat(x, self.d)
+
+
+class PSA(nn.Module):
+
+    def __init__(self, c1, c2, e=0.5):
+        super().__init__()
+        assert (c1 == c2)
+        self.c = int(c1 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c1, 1)
+
+        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=self.c // 64)
+        self.ffn = nn.Sequential(
+            Conv(self.c, self.c * 2, 1),
+            Conv(self.c * 2, self.c, 1, act=False)
+        )
+
+    def forward(self, x):
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = b + self.attn(b)
+        b = b + self.ffn(b)
+        return self.cv2(torch.cat((a, b), 1))
+
+
+class SCDown(nn.Module):
+    def __init__(self, c1, c2, k, s):
+        super().__init__()
+        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
+
+    def forward(self, x):
+        return self.cv2(self.cv1(x))
+
+
+class PAM(nn.Module):
+    def __init__(self, inp, reduction=32):
+        self.oup = inp
+        super().__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+
+        self.conv1_dw = nn.Conv2d(int(inp * 0.5), int(inp * 0.5), kernel_size=1, stride=1, padding=0,
+                                  groups=int(inp * 0.5))
+        self.conv1_pw = nn.Conv2d(int(inp * 0.5), mip, kernel_size=1, stride=1, padding=0)
+
+        self.conv_h = nn.Conv2d(mip, int(inp * 0.5), kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, int(inp * 0.5), kernel_size=1, stride=1, padding=0)
+
+       
+        self.gate_conv_h = nn.Conv2d(int(inp * 0.5), int(inp * 0.5), kernel_size=1, stride=1, padding=0)
+        self.gate_conv_w = nn.Conv2d(int(inp * 0.5), int(inp * 0.5), kernel_size=1, stride=1, padding=0)
+
+        self.conv2 = nn.Conv2d(inp, self.oup, kernel_size=1, stride=1, padding=0)
+
+        
+        self.convg = nn.Conv2d(inp, inp, kernel_size=1, stride=1, padding=0)
+        self.convdd = nn.Conv2d(inp, mip, kernel_size=1, stride=2, padding=0)
+        self.convd = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.relu = nn.LeakyReLU()
+        self.convt = nn.Conv2d(inp, inp, kernel_size=1, stride=1, padding=0)
+        self.softmax = torch.nn.Sigmoid()
+
+    def forward(self, x):
+    
+        x1 = x[:, :int(self.oup * 0.5), :, :]
+        identity = x1
+        n, c, h, w = x1.size()
+        x_h = self.pool_h(x1)
+        x_w = self.pool_w(x1).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+
+       
+        y = self.conv1_dw(y)
+        y = self.conv1_pw(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+     
+        a_h = self.conv_h(x_h).sigmoid()
+
+        a_w = self.conv_w(x_w).sigmoid()
+
+        
+        gate_a_h = self.gate_conv_h(a_h).sigmoid()
+        gate_a_w = self.gate_conv_w(a_w).sigmoid()
+
+        
+        adjusted_a_h = a_h * gate_a_h
+        adjusted_a_w = a_w * gate_a_w
+
+        out = identity * adjusted_a_w * adjusted_a_h
+
+        x2 = x[:, int(self.oup * 0.5):, :, :]
+        out = self.conv2(torch.cat([out, x2], dim=1))
+        # 第二个分支
+        x_g = self.convg(x)
+        x_g = self.gap(x_g)
+        x_g = self.relu(x_g)
+        x_g = self.convt(x_g)
+        p_g = self.softmax(x_g)
+        p_g = x * p_g
+
+        x_d = self.convdd(x)
+        x_d = self.convd(x_d)
+        x_d = self.gap(x_d)
+        x_d = self.relu(x_d)
+        x_d = self.convt(x_d)
+        p_d = self.softmax(x_d)
+        p_d = x * p_d
+
+        out2 = p_g + p_d + out + x
+
+        return out2
+
+
+class ParallelPool(nn.Module):
+   
+
+    def __init__(self, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        
+        self.avg_pool = nn.AvgPool2d(kernel_size, stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool2d(kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        
+        return torch.cat([self.avg_pool(x), self.max_pool(x)], dim=1)
+
+
+class MJFE(nn.Module):
+    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
+        super(MJFE, self).__init__()
+        self.scale = scale
+        self.out_channels = out_planes
+        inter_planes = in_planes // map_reduce
+        # self.branch0 = nn.Sequential(
+        #     BasicConv(in_planes, 2 * inter_planes, kernel_size=1, stride=stride),
+        #     BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=1, relu=False)
+        # )
+        self.branch0 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, inter_planes, kernel_size=(1, 3), stride=stride, padding=(0, 1)),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=1, dilation=1, relu=False)
+        )
+
+        self.branch1 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
+            BasicConv(inter_planes, inter_planes, kernel_size=(3, 1), stride=stride, padding=(1, 0)),
+            BasicConv(inter_planes, inter_planes, kernel_size=3, stride=1, padding=1, dilation=1, relu=False)
+        )
+
+        self.branch2 = nn.Sequential(
+            BasicConv(in_planes, inter_planes, 1, stride=stride),  
+            ParallelPool(),  
+            BasicConv(2 * inter_planes, inter_planes, 3, padding=1, relu=False),  
+            nn.ReLU(), 
+            BasicConv(inter_planes, inter_planes, 3, padding=1, relu=False)
+        )
+
+        self.ConvLinear = BasicConv(3 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False)
+        self.shortcut = BasicConv(in_planes, out_planes, kernel_size=1, stride=stride, relu=False)
+        self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+
+        out = torch.cat((x0, x1, x2), 1)
+        out = self.ConvLinear(out)
+        short = self.shortcut(x)
+        out = out * self.scale + short
+        out = self.relu(out)
+
+        return out
+
+
+class BasicConv(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
+                 bn=True, bias=False):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
+        self.relu = nn.ReLU(inplace=True) if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
